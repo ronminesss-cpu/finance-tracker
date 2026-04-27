@@ -1,0 +1,434 @@
+import { useState, useEffect, useCallback } from "react";
+
+const CATS = {
+  food:          { label: "🍔 אוכל",      color: "#f97316", kw: ["סופר","מסעדה","קפה","מאפייה","שופרסל","רמי לוי","מקדונלד","בורגר","פיצה","סושי","coffee","restaurant","food","cafe","pizza","burger","sushi","supermarket","mega","yochananof","carrefour","freshmarket","AM:PM","am pm"] },
+  transport:     { label: "🚗 תחבורה",    color: "#3b82f6", kw: ["רב קו","אגד","דן","מונית","uber","gett","bolt","yellow","חניה","parking","דלק","סונול","פז","ten","paz"] },
+  health:        { label: "💊 בריאות",    color: "#22c55e", kw: ["בית מרקחת","סופר פארם","super pharm","pharmacy","קופת חולים","מכבי","clalit","leumit","doctor","רופא"] },
+  entertainment: { label: "🎬 בידור",     color: "#ec4899", kw: ["netflix","spotify","apple","steam","yes","hot","הוט","יס","cinema","בר","פאב"] },
+  waste:         { label: "🛍️ בזבוזים",  color: "#a855f7", kw: ["amazon","ebay","aliexpress","zara","h&m","castro","renuar","golf","adidas","nike","mall","קניון"] },
+  bills:         { label: "📄 חשבונות",   color: "#f59e0b", kw: ["חשמל","מים","גז","ארנונה","ביטוח","בנק","credit","הוראת קבע"] },
+  other:         { label: "📦 אחר",       color: "#6b7280", kw: [] },
+};
+
+function detectCat(text) {
+  const t = text.toLowerCase();
+  for (const [k, { kw }] of Object.entries(CATS)) {
+    if (k === "other") continue;
+    if (kw.some(w => t.includes(w.toLowerCase()))) return k;
+  }
+  return "other";
+}
+
+function parseNotification(title = "", text = "") {
+  const full = `${title} ${text}`;
+  const amountRx = [
+    /₪\s*([\d,]+\.?\d*)/,
+    /ILS\s*([\d,]+\.?\d*)/,
+    /([\d,]+\.?\d*)\s*(?:₪|ILS)/,
+    /charged?\s+[\$₪]?\s*([\d,]+\.?\d*)/i,
+    /\b(\d+(?:\.\d{1,2})?)\b/,
+  ];
+  const merchantRx = [
+    /ב[-–]\s*(.{2,40}?)(?:\s*$)/u,
+    /at\s+([A-Za-z\u0590-\u05FF].{1,35}?)(?:\s*$)/iu,
+    /ב[" ](.{2,35})/u,
+  ];
+
+  let amount = null;
+  for (const rx of amountRx) {
+    const m = full.match(rx);
+    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); break; }
+  }
+
+  let merchant = title || "עסקה";
+  for (const rx of merchantRx) {
+    const m = full.match(rx);
+    if (m) { merchant = m[1].trim(); break; }
+  }
+
+  if (!amount || amount <= 0) return null;
+  return { amount, merchant: merchant.slice(0, 60) };
+}
+
+const EXP_KEY = "ff_expenses_v3";
+const LOG_KEY = "ff_whlog_v3";
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const monthStr = (d = new Date()) => d.toISOString().slice(0, 7);
+const fmtDate  = d => new Date(d).toLocaleDateString("he-IL", { day:"2-digit", month:"2-digit", year:"numeric" });
+const fmtTime  = d => new Date(d).toLocaleTimeString("he-IL", { hour:"2-digit", minute:"2-digit" });
+const loadLS   = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
+const saveLS   = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+export default function App() {
+  const [expenses, setExpenses] = useState(() => loadLS(EXP_KEY, []));
+  const [whLog,    setWhLog]    = useState(() => loadLS(LOG_KEY, []));
+  const [view,     setView]     = useState("dashboard");
+  const [toast,    setToast]    = useState(null);
+  const [flash,    setFlash]    = useState(null);
+  const [filterM,  setFilterM]  = useState(monthStr());
+  const [form,     setForm]     = useState({ amount:"", desc:"", category:"food" });
+
+  useEffect(() => saveLS(EXP_KEY, expenses), [expenses]);
+  useEffect(() => saveLS(LOG_KEY, whLog.slice(0, 150)), [whLog]);
+
+  const showToast = (msg, dur=3000) => { setToast(msg); setTimeout(() => setToast(null), dur); };
+
+  const addExpense = useCallback((raw) => {
+    const now = new Date();
+    const exp = {
+      id: `${Date.now()}-${Math.random()}`,
+      amount:   raw.amount,
+      desc:     raw.merchant || raw.desc || "עסקה",
+      category: raw.category || detectCat((raw.merchant||"")+" "+(raw.desc||"")),
+      card:     raw.card || "Google Wallet",
+      date:     now.toISOString(),
+      day:      todayStr(),
+      month:    monthStr(),
+      source:   raw.source || "macrodroid",
+    };
+    setExpenses(prev => [exp, ...prev]);
+    setFlash(exp);
+    setTimeout(() => setFlash(null), 4500);
+    return exp;
+  }, []);
+
+  // ── Handle MacroDroid webhook via URL params ──
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    if (!p.get("md")) return;
+
+    const title = p.get("title") || "";
+    const text  = p.get("text")  || "";
+    const card  = p.get("card")  || "Google Wallet";
+
+    const logEntry = { ts: new Date().toISOString(), raw: `${title} | ${text}`, status:"pending" };
+    const parsed = parseNotification(title, text);
+
+    if (parsed) {
+      addExpense({ ...parsed, card, source:"macrodroid" });
+      logEntry.status = "ok";
+      logEntry.result = `₪${parsed.amount} @ ${parsed.merchant}`;
+    } else {
+      logEntry.status = "failed";
+      logEntry.result = "לא זוהה סכום";
+    }
+
+    setWhLog(prev => [logEntry, ...prev]);
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  const simulateWebhook = () => {
+    const samples = [
+      { title:"Google Wallet", text:"שולמו ₪49.90 ב-שופרסל" },
+      { title:"Google Pay",    text:"תשלום של ₪120.00 אושר ב-AM:PM" },
+      { title:"Google Wallet", text:"Charged ₪35.50 at Cafe Joe" },
+      { title:"Google Pay",    text:"שולמו ₪250.00 ב-Castro" },
+      { title:"Google Wallet", text:"₪18.90 ב-רמי לוי" },
+    ];
+    const s = samples[Math.floor(Math.random()*samples.length)];
+    const parsed = parseNotification(s.title, s.text);
+    if (parsed) {
+      addExpense({ ...parsed, card:"Google Wallet", source:"macrodroid" });
+      setWhLog(prev => [{ ts:new Date().toISOString(), raw:`${s.title} | ${s.text}`, status:"ok", result:`₪${parsed.amount} @ ${parsed.merchant}` }, ...prev]);
+      showToast(`🔔 סימולציה: ₪${parsed.amount} — ${parsed.merchant}`);
+    }
+  };
+
+  const todayExps  = expenses.filter(e => e.day === todayStr());
+  const monthExps  = expenses.filter(e => e.month === filterM);
+  const todayTotal = todayExps.reduce((s,e) => s+e.amount, 0);
+  const monthTotal = monthExps.reduce((s,e) => s+e.amount, 0);
+  const byCat      = Object.fromEntries(Object.keys(CATS).map(k => [k, monthExps.filter(e=>e.category===k).reduce((s,e)=>s+e.amount,0)]));
+  const topCat     = Object.entries(byCat).sort((a,b)=>b[1]-a[1])[0];
+
+  const groupByDay = list => {
+    const g = {};
+    list.forEach(e => { if (!g[e.day]) g[e.day]=[]; g[e.day].push(e); });
+    return Object.entries(g).sort((a,b)=>b[0].localeCompare(a[0]));
+  };
+
+  const addManual = () => {
+    const amt = parseFloat(form.amount);
+    if (!amt || amt<=0) return showToast("סכום לא תקין");
+    if (!form.desc.trim()) return showToast("הכנס תיאור");
+    addExpense({ amount:amt, merchant:form.desc.trim(), category:form.category, card:"ידני", source:"manual" });
+    setForm({ amount:"", desc:"", category:"food" });
+    showToast("✅ נוסף!");
+    setView("dashboard");
+  };
+
+  const deleteExp = id => setExpenses(p => p.filter(e=>e.id!==id));
+
+  const appURL = window.location.origin;
+  const webhookURL = `${appURL}/?md=1&title=[notification_title]&text=[notification_text]`;
+
+  const sendWA = () => {
+    const lines = [
+      `📊 *סיכום הוצאות — ${fmtDate(new Date())}*`, ``,
+      `💳 *היום:* ₪${todayTotal.toFixed(2)} (${todayExps.length} עסקאות)`,
+      `📅 *החודש:* ₪${monthTotal.toFixed(2)}`, ``,
+      `*פירוט היום:*`,
+      ...todayExps.map(e=>`• ${CATS[e.category].label} ${e.desc} — ₪${e.amount.toFixed(2)}`), ``,
+      `*💡 המלצות:*`,
+      topCat?.[1]>0 ? `• קטגוריה מובילה: ${CATS[topCat[0]].label} (₪${topCat[1].toFixed(0)})` : "",
+      monthTotal>4000 ? `• ⚠️ הוצאות גבוהות החודש!` : `• ✅ הוצאות בטווח סביר`,
+    ].filter(Boolean).join("\n");
+    window.open(`https://wa.me/?text=${encodeURIComponent(lines)}`, "_blank");
+  };
+
+  return (
+    <div style={S.root}>
+      <div style={S.bgA}/><div style={S.bgB}/>
+
+      {flash && (
+        <div style={S.flash}>
+          <span style={S.flashIcon}>🔔</span>
+          <div>
+            <div style={S.flashTitle}>עסקה חדשה נכנסה!</div>
+            <div style={S.flashSub}>{flash.desc} — <b>₪{flash.amount.toFixed(2)}</b></div>
+            <div style={S.flashCat}>{CATS[flash.category].label}</div>
+          </div>
+        </div>
+      )}
+
+      {toast && <div style={S.toast}>{toast}</div>}
+
+      <header style={S.header}>
+        <div style={S.brand}>
+          <div style={S.mark}>₪</div>
+          <span style={S.brandName}>FinanceFlow</span>
+          <span style={S.badge}>MacroDroid</span>
+        </div>
+        <button style={S.simBtn} onClick={simulateWebhook}>🔔 בדיקה</button>
+      </header>
+
+      <nav style={S.nav}>
+        {[["dashboard","🏠","בית"],["add","➕","הוסף"],["history","📋","היסטוריה"],["setup","⚙️","הגדרה"],["log","📡","לוג"]].map(([v,ic,lb])=>(
+          <button key={v} style={{...S.navBtn,...(view===v?S.navActive:{})}} onClick={()=>setView(v)}>
+            <span style={{fontSize:18}}>{ic}</span>
+            <span style={{fontSize:9,color:"inherit"}}>{lb}</span>
+          </button>
+        ))}
+      </nav>
+
+      <main style={S.main}>
+
+        {view==="dashboard" && <>
+          <div style={S.statsRow}>
+            <StatCard label="היום" value={`₪${todayTotal.toFixed(2)}`} sub={`${todayExps.length} עסקאות`} color="#f97316"/>
+            <StatCard label="החודש" value={`₪${monthTotal.toFixed(2)}`} sub={filterM} color="#6366f1"/>
+          </div>
+          <Section title="פילוח קטגוריות החודש">
+            {Object.entries(byCat).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).map(([cat,val])=>
+              <Bar key={cat} label={CATS[cat].label} val={val} total={monthTotal} color={CATS[cat].color}/>
+            )}
+            {monthTotal===0 && <Empty text="אין הוצאות. ודא שMacroDroid מוגדר נכון ⚙️"/>}
+          </Section>
+          <Section title={`היום — ${fmtDate(new Date())}`}>
+            {todayExps.length===0 && <Empty text="אין הוצאות היום"/>}
+            {todayExps.map(e=><ExpRow key={e.id} e={e} onDelete={deleteExp}/>)}
+          </Section>
+          <button style={S.waBtn} onClick={sendWA}>📲 שלח סיכום ל-WhatsApp</button>
+        </>}
+
+        {view==="add" && <>
+          <h2 style={S.ptitle}>הוספה ידנית</h2>
+          <Section>
+            <Lbl>סכום (₪)</Lbl>
+            <input style={S.inp} type="number" placeholder="0.00" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})}/>
+            <Lbl>תיאור</Lbl>
+            <input style={S.inp} type="text" placeholder="לדוגמה: קפה ועוגה" value={form.desc} onChange={e=>setForm({...form,desc:e.target.value})}/>
+            <Lbl>קטגוריה</Lbl>
+            <div style={S.catGrid}>
+              {Object.entries(CATS).map(([k,{label,color}])=>(
+                <button key={k} onClick={()=>setForm({...form,category:k})}
+                  style={{...S.catBtn, border:form.category===k?`2px solid ${color}`:"2px solid transparent", background:form.category===k?color+"22":"rgba(255,255,255,0.04)"}}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button style={S.primaryBtn} onClick={addManual}>➕ הוסף</button>
+          </Section>
+        </>}
+
+        {view==="history" && <>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <h2 style={{...S.ptitle,margin:0}}>היסטוריה</h2>
+            <input type="month" style={{...S.inp,width:"auto",fontSize:13}} value={filterM} onChange={e=>setFilterM(e.target.value)}/>
+          </div>
+          {groupByDay(monthExps).map(([day,exps])=>(
+            <Section key={day}>
+              <div style={S.dayHdr}>
+                <span style={S.dayDate}>{fmtDate(day)}</span>
+                <span style={S.dayTot}>₪{exps.reduce((s,e)=>s+e.amount,0).toFixed(2)}</span>
+              </div>
+              {exps.map(e=><ExpRow key={e.id} e={e} onDelete={deleteExp} showTime/>)}
+            </Section>
+          ))}
+          {monthExps.length===0 && <Empty text="אין הוצאות לחודש זה"/>}
+        </>}
+
+        {view==="setup" && <>
+          <h2 style={S.ptitle}>⚙️ הגדרת MacroDroid</h2>
+
+          <Section title="🔗 הכתובת שלך (לאחר פריסה ב-Vercel)">
+            <div style={S.urlBox}>
+              <code style={S.urlCode}>{webhookURL}</code>
+              <button style={S.copyBtn} onClick={()=>{navigator.clipboard.writeText(webhookURL);showToast("הועתק ✅");}}>
+                📋 העתק
+              </button>
+            </div>
+            <p style={S.hint}>עדכן את הכתובת ב-MacroDroid לאחר הפריסה</p>
+          </Section>
+
+          <Section title="📋 הוראות MacroDroid">
+            <Step n={1} title="Trigger" text='Notification Received → Google Wallet (כבר הגדרת ✅)'/>
+            <Step n={2} title="Action — HTTP Request">
+              <ul style={S.ul}>
+                <li style={S.li}>Method: <b>GET</b></li>
+                <li style={S.li}>URL: הדבק את הכתובת מלמעלה</li>
+                <li style={S.li}>החלף <code>[notification_title]</code> ו-<code>[notification_text]</code> עם המשתנים מ-MacroDroid</li>
+              </ul>
+            </Step>
+            <Step n={3} title="בדיקה" text='לחץ "🔔 בדיקה" בראש האפליקציה — תראה flash ירוק וסימולציה בלוג'/>
+          </Section>
+        </>}
+
+        {view==="log" && <>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <h2 style={{...S.ptitle,margin:0}}>📡 לוג Webhooks</h2>
+            <button style={{...S.copyBtn,fontSize:12}} onClick={()=>{setWhLog([]);showToast("נוקה");}}>🗑️ נקה</button>
+          </div>
+          {whLog.length===0 && <Empty text="ממתין לwebhooks מMacroDroid..."/>}
+          {whLog.map((l,i)=>(
+            <div key={i} style={{...S.logRow, borderColor:l.status==="ok"?"#22c55e44":"#ef444444"}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                <span style={{fontSize:11,color:"#555"}}>{fmtTime(l.ts)}</span>
+                <span style={{fontSize:11,color:l.status==="ok"?"#22c55e":"#f87171"}}>{l.status==="ok"?"✅ זוהה":"❌ נכשל"}</span>
+              </div>
+              <div style={{fontSize:12,color:"#888",marginBottom:3,wordBreak:"break-all"}}>{l.raw}</div>
+              {l.result && <div style={{fontSize:12,color:"#6366f1",fontWeight:600}}>{l.result}</div>}
+            </div>
+          ))}
+        </>}
+
+      </main>
+    </div>
+  );
+}
+
+function StatCard({label,value,sub,color}) {
+  return (
+    <div style={{...S.stat,borderColor:color+"44"}}>
+      <div style={{...S.statBar,background:color}}/>
+      <p style={S.statLbl}>{label}</p>
+      <p style={{...S.statVal,color}}>{value}</p>
+      {sub && <p style={S.statSub}>{sub}</p>}
+    </div>
+  );
+}
+function Section({title,children}) {
+  return <div style={S.card}>{title&&<h3 style={S.cardTitle}>{title}</h3>}{children}</div>;
+}
+function Bar({label,val,total,color}) {
+  const pct = total>0?(val/total)*100:0;
+  return (
+    <div style={S.barRow}>
+      <span style={S.barLbl}>{label}</span>
+      <div style={S.barTrack}><div style={{...S.barFill,width:`${pct}%`,background:color}}/></div>
+      <span style={S.barAmt}>₪{val.toFixed(0)}</span>
+    </div>
+  );
+}
+function ExpRow({e,onDelete,showTime}) {
+  const c = CATS[e.category];
+  return (
+    <div style={S.expRow}>
+      <span style={{...S.dot,background:c.color}}/>
+      <div style={S.expInfo}>
+        <span style={S.expDesc}>{e.desc}</span>
+        <span style={S.expMeta}>{c.label} · {e.card}{e.source==="macrodroid"?" · 🤖":""}{showTime?` · ${fmtTime(e.date)}`:""}</span>
+      </div>
+      <span style={{...S.expAmt,color:c.color}}>₪{e.amount.toFixed(2)}</span>
+      <button style={S.delBtn} onClick={()=>onDelete(e.id)}>✕</button>
+    </div>
+  );
+}
+function Step({n,title,text,children}) {
+  return (
+    <div style={S.step}>
+      <div style={S.stepNum}>{n}</div>
+      <div style={{flex:1}}>
+        <div style={S.stepTitle}>{title}</div>
+        {text&&<div style={S.stepText}>{text}</div>}
+        {children}
+      </div>
+    </div>
+  );
+}
+function Lbl({children}) { return <label style={S.lbl}>{children}</label>; }
+function Empty({text}) { return <p style={S.empty}>{text}</p>; }
+
+const S = {
+  root:      {minHeight:"100vh",background:"#07090f",color:"#dde1f0",fontFamily:"'Segoe UI',sans-serif",direction:"rtl",position:"relative",overflowX:"hidden"},
+  bgA:       {position:"fixed",inset:0,background:"radial-gradient(ellipse 70% 50% at 15% 10%,#0d1a3a 0%,transparent 65%),radial-gradient(ellipse 50% 70% at 85% 90%,#1a0d30 0%,transparent 65%)",pointerEvents:"none"},
+  bgB:       {position:"fixed",inset:0,backgroundImage:"linear-gradient(rgba(255,255,255,0.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.018) 1px,transparent 1px)",backgroundSize:"36px 36px",pointerEvents:"none"},
+  header:    {position:"sticky",top:0,zIndex:100,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 16px",background:"rgba(7,9,15,0.85)",backdropFilter:"blur(20px)",borderBottom:"1px solid rgba(255,255,255,0.06)"},
+  brand:     {display:"flex",alignItems:"center",gap:9},
+  mark:      {width:32,height:32,borderRadius:8,background:"linear-gradient(135deg,#6366f1,#f97316)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:16,color:"#fff",lineHeight:"32px",textAlign:"center"},
+  brandName: {fontSize:18,fontWeight:800,letterSpacing:"-0.5px"},
+  badge:     {fontSize:10,background:"rgba(99,102,241,0.2)",color:"#818cf8",border:"1px solid rgba(99,102,241,0.3)",borderRadius:6,padding:"2px 7px",fontWeight:600},
+  simBtn:    {padding:"7px 12px",borderRadius:8,background:"rgba(245,158,11,0.12)",border:"1px solid rgba(245,158,11,0.25)",color:"#fbbf24",fontSize:12,fontWeight:600,cursor:"pointer"},
+  nav:       {display:"flex",background:"rgba(7,9,15,0.7)",backdropFilter:"blur(10px)",borderBottom:"1px solid rgba(255,255,255,0.05)"},
+  navBtn:    {flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"9px 4px",background:"none",border:"none",color:"#444",cursor:"pointer",transition:"all 0.2s",borderBottom:"2px solid transparent"},
+  navActive: {color:"#6366f1",borderBottomColor:"#6366f1"},
+  main:      {maxWidth:480,margin:"0 auto",padding:"16px 13px 90px"},
+  ptitle:    {fontSize:21,fontWeight:800,marginBottom:14,letterSpacing:"-0.5px"},
+  statsRow:  {display:"grid",gridTemplateColumns:"1fr 1fr",gap:11,marginBottom:12},
+  stat:      {position:"relative",overflow:"hidden",background:"rgba(255,255,255,0.03)",borderRadius:13,border:"1px solid",padding:"13px 13px 11px"},
+  statBar:   {position:"absolute",top:0,left:0,right:0,height:3},
+  statLbl:   {fontSize:10,color:"#555",margin:"0 0 4px",textTransform:"uppercase",letterSpacing:1},
+  statVal:   {fontSize:25,fontWeight:900,margin:"0 0 2px",letterSpacing:"-1px"},
+  statSub:   {fontSize:10,color:"#444",margin:0},
+  card:      {background:"rgba(255,255,255,0.03)",borderRadius:13,border:"1px solid rgba(255,255,255,0.06)",padding:13,marginBottom:11},
+  cardTitle: {fontSize:13,fontWeight:600,margin:"0 0 11px",color:"#888",borderBottom:"1px solid rgba(255,255,255,0.05)",paddingBottom:9},
+  barRow:    {display:"flex",alignItems:"center",gap:9,marginBottom:8},
+  barLbl:    {fontSize:13,width:105,flexShrink:0},
+  barTrack:  {flex:1,height:5,borderRadius:3,background:"rgba(255,255,255,0.07)",overflow:"hidden"},
+  barFill:   {height:"100%",borderRadius:3,transition:"width 0.7s ease"},
+  barAmt:    {fontSize:12,color:"#666",width:46,textAlign:"left",flexShrink:0},
+  expRow:    {display:"flex",alignItems:"center",gap:9,padding:"9px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"},
+  dot:       {width:8,height:8,borderRadius:"50%",flexShrink:0},
+  expInfo:   {flex:1,overflow:"hidden"},
+  expDesc:   {display:"block",fontSize:14,fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
+  expMeta:   {display:"block",fontSize:11,color:"#555",marginTop:2},
+  expAmt:    {fontSize:15,fontWeight:700,flexShrink:0},
+  delBtn:    {background:"none",border:"none",color:"#333",cursor:"pointer",fontSize:13,padding:"2px 4px"},
+  dayHdr:    {display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7,paddingBottom:7,borderBottom:"1px solid rgba(255,255,255,0.05)"},
+  dayDate:   {fontSize:13,fontWeight:600,color:"#888"},
+  dayTot:    {fontSize:15,fontWeight:800,color:"#6366f1"},
+  lbl:       {display:"block",fontSize:12,color:"#666",marginBottom:5,marginTop:11},
+  inp:       {width:"100%",padding:"10px 12px",borderRadius:9,background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.08)",color:"#dde1f0",fontSize:15,outline:"none",boxSizing:"border-box"},
+  catGrid:   {display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7,margin:"4px 0"},
+  catBtn:    {padding:"8px 4px",borderRadius:9,cursor:"pointer",fontSize:12,color:"#ccc",transition:"all 0.2s"},
+  primaryBtn:{width:"100%",marginTop:14,padding:12,borderRadius:10,background:"linear-gradient(135deg,#6366f1,#818cf8)",border:"none",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"},
+  waBtn:     {width:"100%",padding:12,borderRadius:10,background:"linear-gradient(135deg,#25D366,#128C7E)",border:"none",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer",marginTop:4},
+  urlBox:    {background:"rgba(99,102,241,0.08)",border:"1px solid rgba(99,102,241,0.2)",borderRadius:10,padding:12,marginBottom:8},
+  urlCode:   {fontSize:11,color:"#818cf8",wordBreak:"break-all",display:"block",marginBottom:8,lineHeight:1.6},
+  copyBtn:   {padding:"7px 14px",borderRadius:8,background:"rgba(99,102,241,0.15)",border:"1px solid rgba(99,102,241,0.3)",color:"#818cf8",fontSize:13,fontWeight:600,cursor:"pointer"},
+  hint:      {fontSize:12,color:"#555",margin:"6px 0 0",lineHeight:1.5},
+  step:      {display:"flex",gap:11,marginBottom:16,alignItems:"flex-start"},
+  stepNum:   {width:24,height:24,borderRadius:"50%",background:"linear-gradient(135deg,#6366f1,#818cf8)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:800,color:"#fff",flexShrink:0},
+  stepTitle: {fontSize:14,fontWeight:700,color:"#dde1f0",marginBottom:4},
+  stepText:  {fontSize:13,color:"#888",lineHeight:1.5},
+  ul:        {margin:"6px 0 0",paddingRight:16},
+  li:        {fontSize:12,color:"#888",marginBottom:4,lineHeight:1.5},
+  logRow:    {background:"rgba(255,255,255,0.02)",borderRadius:10,border:"1px solid",padding:"10px 12px",marginBottom:8},
+  empty:     {color:"#444",fontSize:13,textAlign:"center",padding:"20px 0",margin:0},
+  toast:     {position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",background:"#12151f",border:"1px solid rgba(255,255,255,0.1)",padding:"10px 20px",borderRadius:11,zIndex:999,fontSize:13,color:"#fff",backdropFilter:"blur(16px)",boxShadow:"0 8px 32px rgba(0,0,0,0.5)",whiteSpace:"nowrap"},
+  flash:     {position:"fixed",top:68,left:"50%",transform:"translateX(-50%)",background:"linear-gradient(135deg,#0f2a1a,#0a1f12)",border:"1px solid #22c55e55",borderRadius:14,padding:"12px 18px",zIndex:998,display:"flex",gap:12,alignItems:"center",boxShadow:"0 8px 32px rgba(0,0,0,0.6)",minWidth:260,maxWidth:"90vw"},
+  flashIcon: {fontSize:26},
+  flashTitle:{fontSize:11,color:"#22c55e",fontWeight:700,marginBottom:3},
+  flashSub:  {fontSize:15,color:"#dde1f0"},
+  flashCat:  {fontSize:11,color:"#555",marginTop:3},
+};
